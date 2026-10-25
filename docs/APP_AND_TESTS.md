@@ -209,6 +209,8 @@ Repo variable `SANITY_TARGET=github` makes push and schedule use the GitHub VM. 
 
 `environment: laptop` on the deploy job makes each deploy appear under the repo's **Deployments** list, with the URL.
 
+No `cache: npm` on laptop jobs: on a self-hosted runner `setup-node` would upload the user's whole `~/.npm` folder (here 3.9 GB) to GitHub's cache after every job, which hung the first deploy for 10 minutes. The laptop already has those files, so the cache is only switched on for GitHub VMs.
+
 Runner: `~/actions-runner-sanity` (name `fedora-laptop-sanity`, label `sanity-laptop`). It's separate from `~/actions-runner`, which belongs to the dotnet demo repo; on a personal account a runner serves one repo.
 ```bash
 cd ~/actions-runner-sanity && ./run.sh                 # start (leave the terminal open)
