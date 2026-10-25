@@ -5,10 +5,11 @@ run-name: Sanity — ${{ github.event_name }} — ${{ inputs.target || vars.SANI
 #   1. Run on every push         -> on.push
 #   2. Run once every 24 hours   -> on.schedule
 #   3. Report for pass AND fail  -> job "sanity": summary step + artifacts, all with if: always()
-#   4. Notify the team every run -> job "notify" (Teams), runs even when tests fail
+#   4. Notify the team every run -> job "notify" (calls notify.yml), runs even when tests fail
 #
 # Flow: plan + secret-scan (in parallel) -> deploy (laptop) -> sanity (tests the deployed app) -> notify
-# secret-scan is a reusable workflow in gitleaks.yml. If it finds a secret, deploy and tests don't run.
+# secret-scan (gitleaks.yml) and notify (notify.yml) are reusable workflows in their own files.
+# If the scan finds a secret, deploy and tests don't run.
 #
 # | Trigger                       | Deploy to laptop | Tests run on        | Tests open            |
 # |-------------------------------|------------------|---------------------|-----------------------|
@@ -232,61 +233,24 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
+  # Calls the reusable workflow in notify.yml. Results go in under "with:",
+  # the webhook under "secrets:" (a called workflow doesn't get the caller's secrets by itself).
   notify:
     name: Notify team
-    runs-on: ubuntu-latest
     needs: [plan, secret-scan, deploy, sanity]
     if: always()   # notify on pass AND on fail
-    steps:
-      - name: Post result to Teams
-        shell: bash
-        env:
-          WEBHOOK: ${{ secrets.TEAMS_WEBHOOK_URL }}
-          JOB_RESULT: ${{ needs.sanity.result }}
-          DEPLOY_RESULT: ${{ needs.deploy.result }}
-          SCAN_RESULT: ${{ needs.secret-scan.result }}
-          LEAKS: ${{ needs.secret-scan.outputs.leaks }}
-          TARGET: ${{ needs.plan.outputs.target }}
-          STATUS: ${{ needs.sanity.outputs.status }}
-          TOTAL: ${{ needs.sanity.outputs.total }}
-          PASSED: ${{ needs.sanity.outputs.passed }}
-          FAILED: ${{ needs.sanity.outputs.failed }}
-          FLAKY: ${{ needs.sanity.outputs.flaky }}
-          FAILED_LIST: ${{ needs.sanity.outputs.failed_list }}
-          TRIGGER: ${{ github.event_name }}
-          BRANCH: ${{ github.ref_name }}
-          SHA: ${{ github.sha }}
-          ACTOR: ${{ github.actor }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          # No status = the tests never ran (secrets found, deploy failed, cancelled, timeout, setup error)
-          if [ -z "$STATUS" ] && [ "$SCAN_RESULT" = "failure" ]; then STATUS="NOT RUN (${LEAKS:-?} secret(s) found)"; fi
-          if [ -z "$STATUS" ] && [ "$DEPLOY_RESULT" = "failure" ]; then STATUS="NOT RUN (deploy failed)"; fi
-          STATUS="${STATUS:-NOT RUN ($JOB_RESULT)}"
-          case "$STATUS" in PASSED) icon="✅" ;; FAILED) icon="❌" ;; *) icon="⚠️" ;; esac
-          title="$icon Sanity tests $STATUS"
-          facts="Passed: ${PASSED:-0} / ${TOTAL:-0} | Failed: ${FAILED:-0} | Flaky: ${FLAKY:-0} | Target: $TARGET | Secret scan: $SCAN_RESULT | Deploy: $DEPLOY_RESULT | Trigger: $TRIGGER | Branch: $BRANCH @ ${SHA:0:7} | By: $ACTOR"
-
-          echo "### 📣 Notification" >> "$GITHUB_STEP_SUMMARY"
-          if [ -z "$WEBHOOK" ]; then
-            echo "::notice::TEAMS_WEBHOOK_URL not set. Message would be: $title | $facts | Failed tests: $FAILED_LIST"
-            echo "Teams not configured. Message would be: **$title** · $facts · Failed tests: $FAILED_LIST" >> "$GITHUB_STEP_SUMMARY"
-            exit 0
-          fi
-
-          jq -n --arg title "$title" --arg facts "$facts" --arg failed "$FAILED_LIST" --arg url "$RUN_URL" '{
-            type: "message",
-            attachments: [{
-              contentType: "application/vnd.microsoft.card.adaptive",
-              content: {
-                type: "AdaptiveCard", version: "1.4",
-                body: [
-                  {type: "TextBlock", text: $title, weight: "Bolder", size: "Medium", wrap: true},
-                  {type: "TextBlock", text: $facts, wrap: true},
-                  {type: "TextBlock", text: ("Failed tests: " + $failed), wrap: true}
-                ],
-                actions: [{type: "Action.OpenUrl", title: "Open report", url: $url}]
-              }
-            }]
-          }' | curl -sS -f -X POST -H "Content-Type: application/json" -d @- "$WEBHOOK"
-          echo "Sent to Teams: **$title**" >> "$GITHUB_STEP_SUMMARY"
+    uses: ./.github/workflows/notify.yml
+    with:
+      target: ${{ needs.plan.outputs.target }}
+      scan_result: ${{ needs.secret-scan.result }}
+      leaks: ${{ needs.secret-scan.outputs.leaks }}
+      deploy_result: ${{ needs.deploy.result }}
+      sanity_result: ${{ needs.sanity.result }}
+      status: ${{ needs.sanity.outputs.status }}
+      total: ${{ needs.sanity.outputs.total }}
+      passed: ${{ needs.sanity.outputs.passed }}
+      failed: ${{ needs.sanity.outputs.failed }}
+      flaky: ${{ needs.sanity.outputs.flaky }}
+      failed_list: ${{ needs.sanity.outputs.failed_list }}
+    secrets:
+      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}

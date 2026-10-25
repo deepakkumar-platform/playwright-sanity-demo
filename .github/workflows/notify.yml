@@ -1,0 +1,96 @@
+name: Notify team (Teams)
+
+# A reusable workflow: sanity-tests.yml calls it with "uses: ./.github/workflows/notify.yml"
+# and passes the results in as inputs. It can also be run on its own from the Actions tab
+# (workflow_dispatch) to send a test message.
+#
+# Secrets are NOT passed to a called workflow automatically: the caller hands over
+# TEAMS_WEBHOOK_URL under "secrets:". No webhook set = the message is only shown in the run summary.
+# The github.* context (trigger, branch, commit, actor, run id) is the caller's, so it isn't passed.
+
+on:
+  workflow_call:
+    inputs:
+      target:        { type: string, default: '' }
+      scan_result:   { type: string, default: '' }   # success / failure / skipped
+      leaks:         { type: string, default: '' }
+      deploy_result: { type: string, default: '' }
+      sanity_result: { type: string, default: '' }
+      status:        { type: string, default: '' }   # PASSED / FAILED, empty = tests never ran
+      total:         { type: string, default: '' }
+      passed:        { type: string, default: '' }
+      failed:        { type: string, default: '' }
+      flaky:         { type: string, default: '' }
+      failed_list:   { type: string, default: '' }
+    secrets:
+      TEAMS_WEBHOOK_URL:
+        required: false
+  workflow_dispatch:
+    inputs:
+      status:
+        description: 'Test message: which result to send'
+        type: choice
+        options: [PASSED, FAILED]
+        default: PASSED
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    name: Post to Teams
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Post result to Teams
+        shell: bash
+        env:
+          WEBHOOK: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          TARGET: ${{ inputs.target }}
+          SCAN_RESULT: ${{ inputs.scan_result }}
+          LEAKS: ${{ inputs.leaks }}
+          DEPLOY_RESULT: ${{ inputs.deploy_result }}
+          JOB_RESULT: ${{ inputs.sanity_result }}
+          STATUS: ${{ inputs.status }}
+          TOTAL: ${{ inputs.total }}
+          PASSED: ${{ inputs.passed }}
+          FAILED: ${{ inputs.failed }}
+          FLAKY: ${{ inputs.flaky }}
+          FAILED_LIST: ${{ inputs.failed_list }}
+          TRIGGER: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # No status = the tests never ran (secrets found, deploy failed, cancelled, timeout, setup error)
+          if [ -z "$STATUS" ] && [ "$SCAN_RESULT" = "failure" ]; then STATUS="NOT RUN (${LEAKS:-?} secret(s) found)"; fi
+          if [ -z "$STATUS" ] && [ "$DEPLOY_RESULT" = "failure" ]; then STATUS="NOT RUN (deploy failed)"; fi
+          STATUS="${STATUS:-NOT RUN ($JOB_RESULT)}"
+          case "$STATUS" in PASSED) icon="✅" ;; FAILED) icon="❌" ;; *) icon="⚠️" ;; esac
+          title="$icon Sanity tests $STATUS"
+          facts="Passed: ${PASSED:-0} / ${TOTAL:-0} | Failed: ${FAILED:-0} | Flaky: ${FLAKY:-0} | Target: ${TARGET:-n/a} | Secret scan: ${SCAN_RESULT:-n/a} | Deploy: ${DEPLOY_RESULT:-n/a} | Trigger: $TRIGGER | Branch: $BRANCH @ ${SHA:0:7} | By: $ACTOR"
+
+          echo "### 📣 Notification" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$WEBHOOK" ]; then
+            echo "::notice::TEAMS_WEBHOOK_URL not set. Message would be: $title | $facts | Failed tests: $FAILED_LIST"
+            echo "Teams not configured. Message would be: **$title** · $facts · Failed tests: $FAILED_LIST" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          jq -n --arg title "$title" --arg facts "$facts" --arg failed "$FAILED_LIST" --arg url "$RUN_URL" '{
+            type: "message",
+            attachments: [{
+              contentType: "application/vnd.microsoft.card.adaptive",
+              content: {
+                type: "AdaptiveCard", version: "1.4",
+                body: [
+                  {type: "TextBlock", text: $title, weight: "Bolder", size: "Medium", wrap: true},
+                  {type: "TextBlock", text: $facts, wrap: true},
+                  {type: "TextBlock", text: ("Failed tests: " + $failed), wrap: true}
+                ],
+                actions: [{type: "Action.OpenUrl", title: "Open report", url: $url}]
+              }
+            }]
+          }' | curl -sS -f -X POST -H "Content-Type: application/json" -d @- "$WEBHOOK"
+          echo "Sent to Teams: **$title**" >> "$GITHUB_STEP_SUMMARY"
