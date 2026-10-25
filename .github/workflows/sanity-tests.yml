@@ -7,7 +7,8 @@ run-name: Sanity — ${{ github.event_name }} — ${{ inputs.target || vars.SANI
 #   3. Report for pass AND fail  -> job "sanity": summary step + artifacts, all with if: always()
 #   4. Notify the team every run -> job "notify" (Teams), runs even when tests fail
 #
-# Flow: plan -> deploy (laptop) -> sanity (tests the deployed app) -> notify
+# Flow: plan + secret-scan (in parallel) -> deploy (laptop) -> sanity (tests the deployed app) -> notify
+# secret-scan is a reusable workflow in gitleaks.yml. If it finds a secret, deploy and tests don't run.
 #
 # | Trigger                       | Deploy to laptop | Tests run on        | Tests open            |
 # |-------------------------------|------------------|---------------------|-----------------------|
@@ -101,9 +102,17 @@ jobs:
             echo "| $EVENT | $TARGET | $deploy | ${base_url:-app started inside the job} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
+  # Calls the reusable workflow in gitleaks.yml. A job with "uses:" has no runs-on or steps:
+  # the called file brings its own.
+  secret-scan:
+    name: Secret scan
+    uses: ./.github/workflows/gitleaks.yml
+    with:
+      full_history: true
+
   deploy:
     name: Deploy to laptop
-    needs: plan
+    needs: [plan, secret-scan]   # no deploy unless the scan is clean
     if: needs.plan.outputs.deploy == 'true'
     runs-on: [self-hosted, sanity-laptop]
     timeout-minutes: 10
@@ -144,9 +153,9 @@ jobs:
 
   sanity:
     name: Run sanity tests
-    needs: [plan, deploy]
-    # Run when the deploy passed or wasn't needed; not when it failed
-    if: always() && needs.plan.result == 'success' && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')
+    needs: [plan, secret-scan, deploy]
+    # Run when the scan was clean and the deploy passed or wasn't needed; not when either failed
+    if: always() && needs.plan.result == 'success' && needs.secret-scan.result == 'success' && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')
     runs-on: ${{ fromJSON(needs.plan.outputs.runs_on) }}
     timeout-minutes: 20
     outputs:
@@ -226,7 +235,7 @@ jobs:
   notify:
     name: Notify team
     runs-on: ubuntu-latest
-    needs: [plan, deploy, sanity]
+    needs: [plan, secret-scan, deploy, sanity]
     if: always()   # notify on pass AND on fail
     steps:
       - name: Post result to Teams
@@ -235,6 +244,8 @@ jobs:
           WEBHOOK: ${{ secrets.TEAMS_WEBHOOK_URL }}
           JOB_RESULT: ${{ needs.sanity.result }}
           DEPLOY_RESULT: ${{ needs.deploy.result }}
+          SCAN_RESULT: ${{ needs.secret-scan.result }}
+          LEAKS: ${{ needs.secret-scan.outputs.leaks }}
           TARGET: ${{ needs.plan.outputs.target }}
           STATUS: ${{ needs.sanity.outputs.status }}
           TOTAL: ${{ needs.sanity.outputs.total }}
@@ -248,12 +259,13 @@ jobs:
           ACTOR: ${{ github.actor }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # No status = the tests never ran (deploy failed, cancelled, timeout, setup error)
+          # No status = the tests never ran (secrets found, deploy failed, cancelled, timeout, setup error)
+          if [ -z "$STATUS" ] && [ "$SCAN_RESULT" = "failure" ]; then STATUS="NOT RUN (${LEAKS:-?} secret(s) found)"; fi
           if [ -z "$STATUS" ] && [ "$DEPLOY_RESULT" = "failure" ]; then STATUS="NOT RUN (deploy failed)"; fi
           STATUS="${STATUS:-NOT RUN ($JOB_RESULT)}"
           case "$STATUS" in PASSED) icon="✅" ;; FAILED) icon="❌" ;; *) icon="⚠️" ;; esac
           title="$icon Sanity tests $STATUS"
-          facts="Passed: ${PASSED:-0} / ${TOTAL:-0} | Failed: ${FAILED:-0} | Flaky: ${FLAKY:-0} | Target: $TARGET | Deploy: $DEPLOY_RESULT | Trigger: $TRIGGER | Branch: $BRANCH @ ${SHA:0:7} | By: $ACTOR"
+          facts="Passed: ${PASSED:-0} / ${TOTAL:-0} | Failed: ${FAILED:-0} | Flaky: ${FLAKY:-0} | Target: $TARGET | Secret scan: $SCAN_RESULT | Deploy: $DEPLOY_RESULT | Trigger: $TRIGGER | Branch: $BRANCH @ ${SHA:0:7} | By: $ACTOR"
 
           echo "### 📣 Notification" >> "$GITHUB_STEP_SUMMARY"
           if [ -z "$WEBHOOK" ]; then

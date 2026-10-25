@@ -1,0 +1,100 @@
+name: Secret scan (Gitleaks)
+
+# A reusable workflow: sanity-tests.yml calls it with "uses: ./.github/workflows/gitleaks.yml".
+# It can also be run on its own from the Actions tab (workflow_dispatch).
+#
+# Fails when Gitleaks finds a secret (password, token, key) in the repo's git history.
+# The report is redacted: it shows file, line, commit and rule, never the secret itself.
+
+on:
+  workflow_call:
+    inputs:
+      full_history:
+        description: 'true = scan every commit; false = only the commits in this push'
+        type: boolean
+        default: true
+    outputs:
+      leaks:
+        description: 'Number of secrets found (0 = clean)'
+        value: ${{ jobs.gitleaks.outputs.leaks }}
+  workflow_dispatch:
+    inputs:
+      full_history:
+        description: 'Scan every commit (untick = only the latest commit)'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  gitleaks:
+    name: Gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      leaks: ${{ steps.scan.outputs.leaks }}
+    env:
+      GITLEAKS_VERSION: 8.30.1
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0   # full history, so old commits are scanned too
+
+      - name: Install Gitleaks ${{ env.GITLEAKS_VERSION }}
+        run: |
+          cd "$RUNNER_TEMP"
+          base="https://github.com/gitleaks/gitleaks/releases/download/v$GITLEAKS_VERSION"
+          file="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -sSfLO "$base/$file"
+          curl -sSfL "$base/gitleaks_${GITLEAKS_VERSION}_checksums.txt" | grep " $file\$" | sha256sum -c -
+          tar -xzf "$file" gitleaks
+          echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+
+      - name: Scan git history
+        id: scan
+        shell: bash
+        env:
+          FULL_HISTORY: ${{ inputs.full_history }}
+          BEFORE: ${{ github.event.before }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          # On a push with full_history=false, scan only the new commits (BEFORE..HEAD)
+          log_opts="" scope="full history"
+          if [ "$FULL_HISTORY" = "false" ]; then
+            if [ "$EVENT" = "push" ] && [ -n "$BEFORE" ] && [ "$BEFORE" != "0000000000000000000000000000000000000000" ]; then
+              log_opts="$BEFORE..HEAD" scope="commits in this push"
+            else
+              log_opts="-1" scope="latest commit"
+            fi
+          fi
+          set +e
+          gitleaks git . --redact --no-banner --verbose \
+            --report-format json --report-path gitleaks-report.json \
+            ${log_opts:+--log-opts="$log_opts"}
+          code=$?
+          set -e
+          leaks=$(jq length gitleaks-report.json 2>/dev/null || echo 0)
+          echo "leaks=$leaks" >> "$GITHUB_OUTPUT"
+          {
+            echo "### 🔐 Secret scan (Gitleaks)"
+            echo "Scanned: $scope"
+            if [ "$leaks" -eq 0 ] && [ "$code" -eq 0 ]; then
+              echo "✅ No secrets found"
+            else
+              echo "❌ $leaks secret(s) found. The values are redacted."
+              echo "| Rule | File | Line | Commit | Author |"
+              echo "|---|---|---|---|---|"
+              jq -r '.[] | "| \(.RuleID) | \(.File) | \(.StartLine) | \(.Commit[0:7]) | \(.Author) |"' gitleaks-report.json
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit $code
+
+      - name: Upload report
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.json
+          retention-days: 7
+          if-no-files-found: ignore
