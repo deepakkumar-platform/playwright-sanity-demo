@@ -1,0 +1,158 @@
+name: Sanity Tests (Playwright)
+run-name: Sanity — ${{ github.event_name }} — ${{ github.ref_name }} — by ${{ github.actor }}
+
+# Task 1 requirements -> where they are in this file:
+#   1. Run on every push         -> on.push
+#   2. Run once every 24 hours   -> on.schedule
+#   3. Report for pass AND fail  -> job "sanity": summary step + artifacts, all with if: always()
+#   4. Notify the team every run -> job "notify" (Teams), runs even when tests fail
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ['**.md']
+  schedule:
+    # Every day at 01:30 UTC = 07:00 IST. Cron is always UTC.
+    - cron: '30 1 * * *'
+  workflow_dispatch:
+    inputs:
+      base_url:
+        description: 'Site to test (empty = repo variable SANITY_BASE_URL, or the local demo app)'
+        required: false
+        default: ''
+      simulate_bug:
+        description: 'DEMO ONLY: start the local app with a bug so SAN-008 fails'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# A newer push cancels an older sanity run on the same branch
+concurrency:
+  group: sanity-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sanity:
+    name: Run sanity tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      status: ${{ steps.summary.outputs.status }}
+      total: ${{ steps.summary.outputs.total }}
+      passed: ${{ steps.summary.outputs.passed }}
+      failed: ${{ steps.summary.outputs.failed }}
+      flaky: ${{ steps.summary.outputs.flaky }}
+      failed_list: ${{ steps.summary.outputs.failed_list }}
+    env:
+      # Empty = Playwright starts the demo app itself (see playwright.config.ts)
+      BASE_URL: ${{ inputs.base_url || vars.SANITY_BASE_URL }}
+      # Test users come from secrets. If not set, the tests use the demo app's users.
+      SANITY_ADMIN_USER: ${{ secrets.SANITY_ADMIN_USER }}
+      SANITY_ADMIN_PASSWORD: ${{ secrets.SANITY_ADMIN_PASSWORD }}
+      SANITY_CHEF_USER: ${{ secrets.SANITY_CHEF_USER }}
+      SANITY_CHEF_PASSWORD: ${{ secrets.SANITY_CHEF_PASSWORD }}
+      DEMO_BUG: ${{ inputs.simulate_bug && 'nutrition' || '' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Playwright browser
+        run: npx playwright install --with-deps chromium
+
+      - name: Run sanity tests
+        run: npx playwright test --grep @sanity
+
+      # Everything below runs whether the tests passed or failed
+      - name: Write report summary
+        id: summary
+        if: always()
+        run: node scripts/sanity-summary.mjs
+
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Upload results (CSV, JUnit, summary)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: sanity-results
+          path: results/
+          retention-days: 14
+          if-no-files-found: ignore
+
+      - name: Upload screenshots, videos and traces of failed tests
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: failed-test-evidence
+          path: test-results/
+          retention-days: 14
+          if-no-files-found: ignore
+
+  notify:
+    name: Notify team
+    runs-on: ubuntu-latest
+    needs: sanity
+    if: always()   # notify on pass AND on fail
+    steps:
+      - name: Post result to Teams
+        shell: bash
+        env:
+          WEBHOOK: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          JOB_RESULT: ${{ needs.sanity.result }}
+          STATUS: ${{ needs.sanity.outputs.status }}
+          TOTAL: ${{ needs.sanity.outputs.total }}
+          PASSED: ${{ needs.sanity.outputs.passed }}
+          FAILED: ${{ needs.sanity.outputs.failed }}
+          FLAKY: ${{ needs.sanity.outputs.flaky }}
+          FAILED_LIST: ${{ needs.sanity.outputs.failed_list }}
+          TRIGGER: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          ACTOR: ${{ github.actor }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # No status = the job died before the summary step (cancelled, timeout, setup error)
+          STATUS="${STATUS:-NOT RUN ($JOB_RESULT)}"
+          case "$STATUS" in PASSED) icon="✅" ;; FAILED) icon="❌" ;; *) icon="⚠️" ;; esac
+          title="$icon Sanity tests $STATUS"
+          facts="Passed: ${PASSED:-0} / ${TOTAL:-0} | Failed: ${FAILED:-0} | Flaky: ${FLAKY:-0} | Trigger: $TRIGGER | Branch: $BRANCH @ ${SHA:0:7} | By: $ACTOR"
+
+          echo "### 📣 Notification" >> "$GITHUB_STEP_SUMMARY"
+          if [ -z "$WEBHOOK" ]; then
+            echo "::notice::TEAMS_WEBHOOK_URL not set. Message would be: $title | $facts | Failed tests: $FAILED_LIST"
+            echo "Teams not configured. Message would be: **$title** · $facts · Failed tests: $FAILED_LIST" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          jq -n --arg title "$title" --arg facts "$facts" --arg failed "$FAILED_LIST" --arg url "$RUN_URL" '{
+            type: "message",
+            attachments: [{
+              contentType: "application/vnd.microsoft.card.adaptive",
+              content: {
+                type: "AdaptiveCard", version: "1.4",
+                body: [
+                  {type: "TextBlock", text: $title, weight: "Bolder", size: "Medium", wrap: true},
+                  {type: "TextBlock", text: $facts, wrap: true},
+                  {type: "TextBlock", text: ("Failed tests: " + $failed), wrap: true}
+                ],
+                actions: [{type: "Action.OpenUrl", title: "Open report", url: $url}]
+              }
+            }]
+          }' | curl -sS -f -X POST -H "Content-Type: application/json" -d @- "$WEBHOOK"
+          echo "Sent to Teams: **$title**" >> "$GITHUB_STEP_SUMMARY"

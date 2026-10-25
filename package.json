@@ -1,0 +1,16 @@
+{
+  "name": "playwright-sanity-demo",
+  "private": true,
+  "scripts": {
+    "start": "node app/server.js",
+    "test": "playwright test",
+    "test:sanity": "playwright test --grep @sanity",
+    "report": "playwright show-report"
+  },
+  "dependencies": {
+    "express": "^5.3.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1"
+  }
+}
