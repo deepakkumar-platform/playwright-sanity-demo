@@ -1,42 +1,152 @@
 name: Sanity Tests (Playwright)
-run-name: Sanity — ${{ github.event_name }} — ${{ github.ref_name }} — by ${{ github.actor }}
+run-name: Sanity — ${{ github.event_name }} — ${{ inputs.target || vars.SANITY_TARGET || 'laptop' }} — by ${{ github.actor }}
 
 # Task 1 requirements -> where they are in this file:
 #   1. Run on every push         -> on.push
 #   2. Run once every 24 hours   -> on.schedule
 #   3. Report for pass AND fail  -> job "sanity": summary step + artifacts, all with if: always()
 #   4. Notify the team every run -> job "notify" (Teams), runs even when tests fail
+#
+# Flow: plan -> deploy (laptop) -> sanity (tests the deployed app) -> notify
+#
+# | Trigger                       | Deploy to laptop | Tests run on        | Tests open            |
+# |-------------------------------|------------------|---------------------|-----------------------|
+# | push to main                  | yes              | laptop              | http://localhost:5100 |
+# | schedule (daily)              | no               | laptop              | the app already there |
+# | manual, target=laptop         | if "deploy" tick | laptop              | http://localhost:5100 |
+# | manual, target=github         | no               | GitHub-hosted (VM)  | app started in the job|
+# Repo variable SANITY_TARGET=github switches push/schedule to the GitHub-hosted mode (laptop off).
 
 on:
   push:
     branches: [main]
-    paths-ignore: ['**.md']
+    paths-ignore: ['**.md', 'docs/**']
   schedule:
     # Every day at 01:30 UTC = 07:00 IST. Cron is always UTC.
     - cron: '30 1 * * *'
   workflow_dispatch:
     inputs:
-      base_url:
-        description: 'Site to test (empty = repo variable SANITY_BASE_URL, or the local demo app)'
-        required: false
-        default: ''
+      target:
+        description: 'laptop = deploy + test on your self-hosted runner; github = test inside a GitHub VM'
+        type: choice
+        options: [laptop, github]
+        default: laptop
+      deploy:
+        description: 'laptop only: deploy this commit before testing'
+        type: boolean
+        default: true
       simulate_bug:
-        description: 'DEMO ONLY: start the local app with a bug so SAN-008 fails'
+        description: 'DEMO ONLY: start the app with a bug so SAN-008 fails'
         type: boolean
         default: false
+      base_url:
+        description: 'Optional: test this URL instead (e.g. a QA site)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
 
-# A newer push cancels an older sanity run on the same branch
+# Runs queue instead of cancelling, so a deploy is never stopped halfway
 concurrency:
   group: sanity-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
+
+env:
+  APP_PORT: 5100
 
 jobs:
+  plan:
+    name: Plan run
+    runs-on: ubuntu-latest
+    outputs:
+      target: ${{ steps.plan.outputs.target }}
+      deploy: ${{ steps.plan.outputs.deploy }}
+      runs_on: ${{ steps.plan.outputs.runs_on }}
+      base_url: ${{ steps.plan.outputs.base_url }}
+    steps:
+      - name: Decide target, deploy and URL
+        id: plan
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          TARGET: ${{ inputs.target || vars.SANITY_TARGET || 'laptop' }}
+          DEPLOY_INPUT: ${{ inputs.deploy }}
+          BASE_URL_INPUT: ${{ inputs.base_url }}
+          BASE_URL_VAR: ${{ vars.SANITY_BASE_URL }}
+        run: |
+          if [ "$TARGET" = "laptop" ]; then
+            runs_on='["self-hosted","sanity-laptop"]'
+            case "$EVENT" in
+              push) deploy=true ;;
+              workflow_dispatch) deploy="$DEPLOY_INPUT" ;;
+              *) deploy=false ;;   # schedule: test what is already deployed
+            esac
+            base_url="${BASE_URL_INPUT:-http://localhost:$APP_PORT}"
+          else
+            runs_on='"ubuntu-latest"'
+            deploy=false
+            base_url="${BASE_URL_INPUT:-$BASE_URL_VAR}"   # empty = Playwright starts the app in the job
+          fi
+          {
+            echo "target=$TARGET"
+            echo "deploy=$deploy"
+            echo "runs_on=$runs_on"
+            echo "base_url=$base_url"
+          } >> "$GITHUB_OUTPUT"
+          {
+            echo "### 🗺️ Plan"
+            echo "| Trigger | Target | Deploy | Tests open |"
+            echo "|---|---|---|---|"
+            echo "| $EVENT | $TARGET | $deploy | ${base_url:-app started inside the job} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to laptop
+    needs: plan
+    if: needs.plan.outputs.deploy == 'true'
+    runs-on: [self-hosted, sanity-laptop]
+    timeout-minutes: 10
+    environment:
+      name: laptop
+      url: http://localhost:${{ env.APP_PORT }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install production dependencies
+        run: npm ci --omit=dev
+
+      - name: Deploy (stop, back up, copy, start, health check)
+        env:
+          DEPLOY_PATH: ~/apps/kitchen-portal
+          BACKUP_ROOT: ~/apps/kitchen-portal-backups
+          PORT: ${{ env.APP_PORT }}
+          RUN_NUMBER: ${{ github.run_number }}
+          DEMO_BUG: ${{ inputs.simulate_bug && 'nutrition' || '' }}
+        run: bash scripts/deploy-laptop.sh
+
+      - name: Deployment summary
+        if: always()
+        env:
+          RESULT: ${{ job.status }}
+          SHA: ${{ github.sha }}
+        run: |
+          {
+            echo "### 🚀 Deploy to laptop: $RESULT"
+            echo "Commit \`${SHA:0:7}\` → http://localhost:$APP_PORT (log: \`~/apps/kitchen-portal/app.log\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
   sanity:
     name: Run sanity tests
-    runs-on: ubuntu-latest
+    needs: [plan, deploy]
+    # Run when the deploy passed or wasn't needed; not when it failed
+    if: always() && needs.plan.result == 'success' && (needs.deploy.result == 'success' || needs.deploy.result == 'skipped')
+    runs-on: ${{ fromJSON(needs.plan.outputs.runs_on) }}
     timeout-minutes: 20
     outputs:
       status: ${{ steps.summary.outputs.status }}
@@ -46,13 +156,14 @@ jobs:
       flaky: ${{ steps.summary.outputs.flaky }}
       failed_list: ${{ steps.summary.outputs.failed_list }}
     env:
-      # Empty = Playwright starts the demo app itself (see playwright.config.ts)
-      BASE_URL: ${{ inputs.base_url || vars.SANITY_BASE_URL }}
+      # Empty = Playwright starts the app itself (see playwright.config.ts)
+      BASE_URL: ${{ needs.plan.outputs.base_url }}
       # Test users come from secrets. If not set, the tests use the demo app's users.
       SANITY_ADMIN_USER: ${{ secrets.SANITY_ADMIN_USER }}
       SANITY_ADMIN_PASSWORD: ${{ secrets.SANITY_ADMIN_PASSWORD }}
       SANITY_CHEF_USER: ${{ secrets.SANITY_CHEF_USER }}
       SANITY_CHEF_PASSWORD: ${{ secrets.SANITY_CHEF_PASSWORD }}
+      # Only used when the app is started inside the job (target=github)
       DEMO_BUG: ${{ inputs.simulate_bug && 'nutrition' || '' }}
     steps:
       - uses: actions/checkout@v7
@@ -66,7 +177,14 @@ jobs:
         run: npm ci
 
       - name: Install Playwright browser
-        run: npx playwright install --with-deps chromium
+        shell: bash
+        run: |
+          # GitHub VMs also need the Linux libraries (needs sudo). Your laptop already has them.
+          if [ "$RUNNER_ENVIRONMENT" = "github-hosted" ]; then
+            npx playwright install --with-deps chromium
+          else
+            npx playwright install chromium
+          fi
 
       - name: Run sanity tests
         run: npx playwright test --grep @sanity
@@ -107,7 +225,7 @@ jobs:
   notify:
     name: Notify team
     runs-on: ubuntu-latest
-    needs: sanity
+    needs: [plan, deploy, sanity]
     if: always()   # notify on pass AND on fail
     steps:
       - name: Post result to Teams
@@ -115,6 +233,8 @@ jobs:
         env:
           WEBHOOK: ${{ secrets.TEAMS_WEBHOOK_URL }}
           JOB_RESULT: ${{ needs.sanity.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
+          TARGET: ${{ needs.plan.outputs.target }}
           STATUS: ${{ needs.sanity.outputs.status }}
           TOTAL: ${{ needs.sanity.outputs.total }}
           PASSED: ${{ needs.sanity.outputs.passed }}
@@ -127,11 +247,12 @@ jobs:
           ACTOR: ${{ github.actor }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          # No status = the job died before the summary step (cancelled, timeout, setup error)
+          # No status = the tests never ran (deploy failed, cancelled, timeout, setup error)
+          if [ -z "$STATUS" ] && [ "$DEPLOY_RESULT" = "failure" ]; then STATUS="NOT RUN (deploy failed)"; fi
           STATUS="${STATUS:-NOT RUN ($JOB_RESULT)}"
           case "$STATUS" in PASSED) icon="✅" ;; FAILED) icon="❌" ;; *) icon="⚠️" ;; esac
           title="$icon Sanity tests $STATUS"
-          facts="Passed: ${PASSED:-0} / ${TOTAL:-0} | Failed: ${FAILED:-0} | Flaky: ${FLAKY:-0} | Trigger: $TRIGGER | Branch: $BRANCH @ ${SHA:0:7} | By: $ACTOR"
+          facts="Passed: ${PASSED:-0} / ${TOTAL:-0} | Failed: ${FAILED:-0} | Flaky: ${FLAKY:-0} | Target: $TARGET | Deploy: $DEPLOY_RESULT | Trigger: $TRIGGER | Branch: $BRANCH @ ${SHA:0:7} | By: $ACTOR"
 
           echo "### 📣 Notification" >> "$GITHUB_STEP_SUMMARY"
           if [ -z "$WEBHOOK" ]; then
