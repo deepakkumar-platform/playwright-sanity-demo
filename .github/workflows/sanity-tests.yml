@@ -5,10 +5,12 @@ run-name: Sanity — ${{ github.event_name }} — ${{ inputs.target || vars.SANI
 #   1. Run on every push         -> on.push
 #   2. Run once every 24 hours   -> on.schedule
 #   3. Report for pass AND fail  -> job "sanity": summary step + artifacts, all with if: always()
-#   4. Notify the team every run -> job "notify" (calls notify.yml), runs even when tests fail
+#   4. Notify the team every run -> e-mail at the start (mail-start) and with the results at the end
+#                                   (mail-end, runs even when tests fail). Both call notify-email.yml
 #
-# Flow: plan + secret-scan (in parallel) -> deploy (laptop) -> sanity (tests the deployed app) -> notify
-# secret-scan (gitleaks.yml) and notify (notify.yml) are reusable workflows in their own files.
+# Flow: plan + secret-scan (in parallel) -> mail-start + deploy (laptop) -> sanity (tests the deployed app) -> mail-end
+# secret-scan (gitleaks.yml) and the mails (notify-email.yml) are reusable workflows in their own files.
+# notify.yml (Teams) is still in the repo but no longer called.
 # If the scan finds a secret, deploy and tests don't run.
 #
 # | Trigger                       | Deploy to laptop | Tests run on        | Tests open            |
@@ -233,15 +235,31 @@ jobs:
           retention-days: 14
           if-no-files-found: ignore
 
-  # Calls the reusable workflow in notify.yml. Results go in under "with:",
-  # the webhook under "secrets:" (a called workflow doesn't get the caller's secrets by itself).
-  notify:
-    name: Notify team
-    needs: [plan, secret-scan, deploy, sanity]
-    if: always()   # notify on pass AND on fail
-    uses: ./.github/workflows/notify.yml
+  # E-mail 1 of 2: "run started". Nothing waits for it, so it never slows the tests down.
+  # Results go in under "with:", the SMTP login under "secrets:"
+  # (a called workflow doesn't get the caller's secrets by itself).
+  mail-start:
+    name: E-mail (started)
+    needs: plan
+    uses: ./.github/workflows/notify-email.yml
     with:
+      phase: start
       target: ${{ needs.plan.outputs.target }}
+      base_url: ${{ needs.plan.outputs.base_url }}
+    secrets:
+      SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+
+  # E-mail 2 of 2: the results, on pass AND on fail
+  mail-end:
+    name: E-mail (results)
+    needs: [plan, secret-scan, deploy, sanity]
+    if: always()
+    uses: ./.github/workflows/notify-email.yml
+    with:
+      phase: end
+      target: ${{ needs.plan.outputs.target }}
+      base_url: ${{ needs.plan.outputs.base_url }}
       scan_result: ${{ needs.secret-scan.result }}
       leaks: ${{ needs.secret-scan.outputs.leaks }}
       deploy_result: ${{ needs.deploy.result }}
@@ -251,6 +269,6 @@ jobs:
       passed: ${{ needs.sanity.outputs.passed }}
       failed: ${{ needs.sanity.outputs.failed }}
       flaky: ${{ needs.sanity.outputs.flaky }}
-      failed_list: ${{ needs.sanity.outputs.failed_list }}
     secrets:
-      TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+      SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+      SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}

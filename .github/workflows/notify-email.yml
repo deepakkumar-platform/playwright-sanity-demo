@@ -1,0 +1,117 @@
+name: Notify team (e-mail)
+
+# A reusable workflow: sanity-tests.yml calls it twice,
+#   phase: start -> "run started" mail, right after the plan job
+#   phase: end   -> results mail (stages, test table, secrets found, CSV attached)
+# It can also be run on its own from the Actions tab to send a test mail.
+#
+# Sends with scripts/send_mail.py (Python standard library, nothing to install).
+# Settings (Settings -> Secrets and variables -> Actions):
+#   Variables: SMTP_SERVER, SMTP_PORT, MAIL_TO, optional MAIL_CC, MAIL_FROM, SMTP_SECURITY
+#   Secrets:   SMTP_USERNAME, SMTP_PASSWORD (the caller passes them under "secrets:")
+# No SMTP_SERVER or MAIL_TO = nothing is sent; the run summary says what would have been,
+# and the e-mail is uploaded as the email-preview-<phase> artifact.
+
+on:
+  workflow_call:
+    inputs:
+      phase:         { type: string, required: true }   # start / end
+      target:        { type: string, default: '' }
+      base_url:      { type: string, default: '' }
+      scan_result:   { type: string, default: '' }      # success / failure / skipped
+      leaks:         { type: string, default: '' }
+      deploy_result: { type: string, default: '' }
+      sanity_result: { type: string, default: '' }
+      status:        { type: string, default: '' }      # PASSED / FAILED, empty = tests never ran
+      total:         { type: string, default: '' }
+      passed:        { type: string, default: '' }
+      failed:        { type: string, default: '' }
+      flaky:         { type: string, default: '' }
+    secrets:
+      SMTP_USERNAME: { required: false }
+      SMTP_PASSWORD: { required: false }
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: 'Test mail: which one to send'
+        type: choice
+        options: [start, end]
+        default: start
+
+permissions:
+  contents: read
+
+jobs:
+  mail:
+    name: Send e-mail (${{ inputs.phase }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: scripts/send_mail.py
+          sparse-checkout-cone-mode: false
+
+      # Results from the same run. They don't exist when the tests or the scan didn't
+      # produce them, so a missing artifact is not an error.
+      - name: Get test results
+        if: inputs.phase == 'end'
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: sanity-results
+          path: results
+
+      - name: Get secret scan report
+        if: inputs.phase == 'end'
+        uses: actions/download-artifact@v8
+        continue-on-error: true
+        with:
+          name: gitleaks-report
+          path: gitleaks
+
+      - name: Send
+        env:
+          PHASE: ${{ inputs.phase }}
+          SMTP_SERVER: ${{ vars.SMTP_SERVER }}
+          SMTP_PORT: ${{ vars.SMTP_PORT || '587' }}
+          SMTP_SECURITY: ${{ vars.SMTP_SECURITY || 'starttls' }}
+          SMTP_USERNAME: ${{ secrets.SMTP_USERNAME }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          MAIL_FROM: ${{ vars.MAIL_FROM }}
+          MAIL_TO: ${{ vars.MAIL_TO }}
+          MAIL_CC: ${{ vars.MAIL_CC }}
+          TARGET: ${{ inputs.target }}
+          BASE_URL: ${{ inputs.base_url }}
+          SCAN_RESULT: ${{ inputs.scan_result }}
+          LEAKS: ${{ inputs.leaks }}
+          DEPLOY_RESULT: ${{ inputs.deploy_result }}
+          SANITY_RESULT: ${{ inputs.sanity_result }}
+          STATUS: ${{ inputs.status }}
+          TOTAL: ${{ inputs.total }}
+          PASSED: ${{ inputs.passed }}
+          FAILED: ${{ inputs.failed }}
+          FLAKY: ${{ inputs.flaky }}
+          RESULTS_CSV: results/sanity-results.csv
+          GITLEAKS_REPORT: gitleaks/gitleaks-report.json
+          PREVIEW_FILE: email-preview.html
+          # github.* is the caller's run (trigger, branch, commit, actor), so it isn't passed in
+          REPO: ${{ github.repository }}
+          TRIGGER: ${{ github.event_name }}
+          BRANCH: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          ACTOR: ${{ github.actor }}
+          WORKFLOW: ${{ github.workflow }}
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 scripts/send_mail.py
+
+      - name: Upload e-mail preview
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: email-preview-${{ inputs.phase }}
+          path: email-preview.html
+          retention-days: 7
+          if-no-files-found: ignore

@@ -7,12 +7,12 @@ A small "Kitchen Portal" web app, Playwright sanity tests named after the sanity
 | Run on every push | `on: push` (branch `main`) |
 | Run once every 24 hours | `on: schedule`, `30 1 * * *` = 07:00 IST |
 | Report for pass **and** fail | Run summary table + `playwright-report` (HTML) + `sanity-results` (CSV / JUnit) artifacts |
-| Notify the team every run | `notify` job → Teams Adaptive Card (or a notice when the webhook isn't set) |
+| Notify the team every run | `mail-start` + `mail-end` jobs → an e-mail when the run starts and one with the results (or a notice + `email-preview` artifact when SMTP isn't set) |
 
 On every push the app is also **deployed to a laptop** (self-hosted runner) and the tests run against it at http://localhost:5100:
 
 ```
-plan (GitHub VM) → deploy (laptop) → sanity (laptop) → notify (GitHub VM)
+plan (GitHub VM) → mail-start (GitHub VM) + deploy (laptop) → sanity (laptop) → mail-end (GitHub VM)
 ```
 
 Full explanation of the app, its login and access flows, every test case and the deploy: **[docs/APP_AND_TESTS.md](docs/APP_AND_TESTS.md)**.
@@ -26,7 +26,11 @@ tests/sanity/*.spec.ts       the sanity tests, tagged @sanity
 playwright.config.ts         reporters, retries, screenshots/trace, starts the app when BASE_URL is empty
 scripts/sanity-summary.mjs   results.json → summary table, CSV, step outputs
 scripts/deploy-laptop.sh     stop → back up → copy → start → health check → roll back
+scripts/send_mail.py         the two e-mails (Python standard library, SMTP + STARTTLS)
 .github/workflows/sanity-tests.yml
+.github/workflows/notify-email.yml   reusable: sends the start / results e-mail
+.github/workflows/gitleaks.yml       reusable: secret scan
+.github/workflows/notify.yml         reusable: Teams card (not called any more)
 .github/actionlint.yaml      tells actionlint about the custom runner label
 docs/APP_AND_TESTS.md        the app, flows, test cases, deploy
 ```
@@ -64,7 +68,10 @@ The workflow has no `pull_request` trigger, so fork PRs can't run code on the se
 | `SANITY_TARGET` | Variable | Optional. `github` = push/schedule test inside a GitHub VM (laptop off). Default `laptop` |
 | `SANITY_BASE_URL` | Variable | Optional, target=github only. Empty = test the demo app inside the runner |
 | `SANITY_ADMIN_USER` / `_PASSWORD`, `SANITY_CHEF_USER` / `_PASSWORD` | Secrets | Only for a real site |
-| `TEAMS_WEBHOOK_URL` | Secret | Optional. Without it the run summary shows the message it would send |
+| `SMTP_SERVER`, `SMTP_PORT` | Variables | E.g. `smtp.office365.com` / `587` (or `smtp.gmail.com` / `587`). Without `SMTP_SERVER` no mail is sent, only previewed |
+| `MAIL_TO`, optional `MAIL_CC` | Variables | Recipients, comma or semicolon separated |
+| `MAIL_FROM`, `SMTP_SECURITY` | Variables | Optional. `MAIL_FROM` defaults to the login. `SMTP_SECURITY` = `starttls` (default) or `ssl` (port 465) |
+| `SMTP_USERNAME`, `SMTP_PASSWORD` | Secrets | The mailbox that sends |
 
 ## Adding a test
 

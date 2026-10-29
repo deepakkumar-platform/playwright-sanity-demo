@@ -1,6 +1,7 @@
 name: Notify team (Teams)
 
-# A reusable workflow: sanity-tests.yml calls it with "uses: ./.github/workflows/notify.yml"
+# NOT CALLED ANY MORE: the team gets e-mails instead (notify-email.yml). Kept in case Teams is wanted again.
+# To use it, add a job to sanity-tests.yml that calls it with "uses: ./.github/workflows/notify.yml"
 # and passes the results in as inputs. It can also be run on its own from the Actions tab
 # (workflow_dispatch) to send a test message.
 #
